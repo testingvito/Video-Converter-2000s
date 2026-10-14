@@ -1,6 +1,8 @@
 ﻿Imports System.IO
 Imports System.Diagnostics
+Imports System.Text
 Imports System.Drawing
+Imports System.Threading.Tasks
 Imports System.Windows.Forms
 
 Public Class Form1
@@ -55,7 +57,7 @@ Public Class Form1
         }
         pnlDrop.Controls.Add(lblDropText)
 
-        ' RadioButtons
+        ' RadioButtons Norma
         rbNTSC = New RadioButton() With {
             .Text = "NTSC (352x240 @ 29.97fps)",
             .Checked = True,
@@ -71,7 +73,7 @@ Public Class Form1
             .Font = New Font("Segoe UI", 9)
         }
 
-        ' Botones
+        ' Botón Buscar Video
         btnBrowse = New Button() With {
             .Text = "Buscar Video...",
             .Size = New Size(130, 35),
@@ -79,6 +81,7 @@ Public Class Form1
             .Font = New Font("Segoe UI", 9)
         }
 
+        ' Botón Convertir
         btnConvert = New Button() With {
             .Text = "Convertir y Guardar...",
             .Size = New Size(160, 35),
@@ -87,7 +90,7 @@ Public Class Form1
             .Enabled = False
         }
 
-        ' Estado
+        ' Etiqueta de Estado
         lblStatus = New Label() With {
             .Text = "Carga un video para comenzar.",
             .Font = New Font("Segoe UI", 8.5F, FontStyle.Italic),
@@ -99,6 +102,7 @@ Public Class Form1
 
         Me.Controls.AddRange(New Control() {lblTitle, pnlDrop, rbNTSC, rbPAL, btnBrowse, btnConvert, lblStatus})
 
+        ' Eventos
         AddHandler Me.DragEnter, AddressOf Form_DragEnter
         AddHandler Me.DragDrop, AddressOf Form_DragDrop
         AddHandler pnlDrop.DragEnter, AddressOf Form_DragEnter
@@ -138,10 +142,13 @@ Public Class Form1
         End Using
     End Sub
 
-    Private Sub BtnConvert_Click(sender As Object, e As EventArgs)
+    Private Function Quote(path As String) As String
+        Return $"""{path}"""
+    End Function
+
+    Private Async Sub BtnConvert_Click(sender As Object, e As EventArgs)
         If String.IsNullOrEmpty(selectedFilePath) OrElse Not File.Exists(selectedFilePath) Then Return
 
-        Dim targetStandard As String = If(rbNTSC.Checked, "ntsc-vcd", "pal-vcd")
         Dim normLabel As String = If(rbNTSC.Checked, "NTSC", "PAL")
         Dim defaultName As String = Path.GetFileNameWithoutExtension(selectedFilePath) & " Kazaa " & normLabel & ".mpg"
 
@@ -151,75 +158,161 @@ Public Class Form1
             sfd.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Desktop)
 
             If sfd.ShowDialog() = DialogResult.OK Then
-                ConvertVideo(selectedFilePath, sfd.FileName, targetStandard)
+                btnConvert.Enabled = False
+                btnBrowse.Enabled = False
+                lblStatus.Text = "Procesando video con FFmpeg... Por favor espera."
+
+                Try
+                    Dim exitCode = Await RunFfmpegAsync(selectedFilePath, sfd.FileName, usePal:=rbPAL.Checked)
+                    lblStatus.Text = "¡Éxito! Guardado en: " & Path.GetFileName(sfd.FileName)
+                    MessageBox.Show("¡Conversión completada con éxito!", "Kazaa Converter", MessageBoxButtons.OK, MessageBoxIcon.Information)
+                Catch ex As Exception
+                    lblStatus.Text = "Error durante la conversión."
+                    MessageBox.Show($"Error: {ex.Message}", "Error FFmpeg", MessageBoxButtons.OK, MessageBoxIcon.Error)
+                Finally
+                    btnConvert.Enabled = True
+                    btnBrowse.Enabled = True
+                End Try
             End If
         End Using
     End Sub
 
-    ' Método directo para encontrar ffmpeg.exe al lado de la aplicación
-    Private Function GetLocalFFmpegPath() As String
-        ' 1. Ruta exacta del directorio donde se ejecuta esta aplicación (.exe)
-        Dim appDir As String = AppDomain.CurrentDomain.BaseDirectory
-        Dim ffmpegPath As String = Path.Combine(appDir, "ffmpeg.exe")
+    ' Busca ffmpeg.exe en varias ubicaciones. Si se encuentra en la raíz del proyecto,
+    ' devuelve la ruta y marca foundInProjectRoot = True para indicar que se puede copiar al bin.
+    Private Function FindFfmpegExecutable(ByRef foundInProjectRoot As Boolean) As String
+        foundInProjectRoot = False
+        Dim exeName = "ffmpeg.exe"
+        Dim baseDir = AppDomain.CurrentDomain.BaseDirectory
+        Dim startup = Application.StartupPath
 
-        If File.Exists(ffmpegPath) Then
-            Return ffmpegPath
+        ' 1) AppDomain.CurrentDomain.BaseDirectory
+        Dim candidate = Path.Combine(baseDir, exeName)
+        If File.Exists(candidate) Then Return candidate
+
+        ' 2) Application.StartupPath
+        candidate = Path.Combine(startup, exeName)
+        If File.Exists(candidate) Then Return candidate
+
+        ' 3) Subir niveles desde baseDir buscando la raíz del proyecto (hasta 4 niveles)
+        Try
+            Dim dirInfo = New DirectoryInfo(baseDir)
+            For i As Integer = 1 To 4
+                If dirInfo.Parent Is Nothing Then Exit For
+                dirInfo = dirInfo.Parent
+                candidate = Path.Combine(dirInfo.FullName, exeName)
+                If File.Exists(candidate) Then
+                    foundInProjectRoot = True
+                    Return candidate
+                End If
+            Next
+        Catch
+            ' ignorar errores de IO al inspeccionar directorios
+        End Try
+
+        ' 4) Buscar en PATH del sistema
+        Dim pathEnv = Environment.GetEnvironmentVariable("PATH")
+        If Not String.IsNullOrEmpty(pathEnv) Then
+            For Each p In pathEnv.Split(";"c)
+                If String.IsNullOrWhiteSpace(p) Then Continue For
+                Try
+                    candidate = Path.Combine(p.Trim(), exeName)
+                    If File.Exists(candidate) Then Return candidate
+                Catch
+                    ' ignorar rutas inválidas
+                End Try
+            Next
         End If
 
-        ' 2. Verificación secundaria en Application.StartupPath
-        Dim startupPath As String = Path.Combine(Application.StartupPath, "ffmpeg.exe")
-        If File.Exists(startupPath) Then
-            Return startupPath
-        End If
-
-        ' 3. Intento en el PATH general del sistema Windows
-        Return "ffmpeg.exe"
+        Return Nothing
     End Function
 
-    Private Async Sub ConvertVideo(inputPath As String, outputPath As String, targetStandard As String)
-        btnConvert.Enabled = False
-        btnBrowse.Enabled = False
-        lblStatus.Text = "Procesando video con FFmpeg... Por favor espera."
+    ' Método refactorizado para ejecutar FFmpeg asíncronamente con búsqueda tolerante y copia automática
+    Public Async Function RunFfmpegAsync(inputPath As String, outputPath As String, Optional usePal As Boolean = False) As Task(Of Integer)
+        If String.IsNullOrWhiteSpace(inputPath) OrElse Not File.Exists(inputPath) Then
+            Throw New FileNotFoundException("Archivo de entrada no encontrado.", inputPath)
+        End If
 
-        Await Task.Run(Sub()
-                           Try
-                               Dim ffmpegPath As String = GetLocalFFmpegPath()
+        Dim baseDir = AppDomain.CurrentDomain.BaseDirectory
+        Dim foundInProjectRoot As Boolean = False
+        Dim ffmpegFound = FindFfmpegExecutable(foundInProjectRoot)
 
-                               ' Verificar que el archivo existe si no está registrado en variables de entorno del sistema
-                               If ffmpegPath <> "ffmpeg.exe" AndAlso Not File.Exists(ffmpegPath) Then
-                                   Throw New FileNotFoundException("No se encontró 'ffmpeg.exe' en la carpeta de la aplicación.")
-                               End If
+        If ffmpegFound Is Nothing Then
+            Throw New FileNotFoundException("No se encontró 'ffmpeg.exe' en las ubicaciones esperadas. Coloca ffmpeg.exe en el proyecto (Build Action=Content, CopyToOutputDirectory=PreserveNewest) o instálalo en el PATH.")
+        End If
 
-                               Dim startInfo As New ProcessStartInfo() With {
-                                   .FileName = ffmpegPath,
-                                   .Arguments = $"-y -i ""{inputPath}"" -target {targetStandard} -b:a 128k ""{outputPath}""",
-                                   .UseShellExecute = False,
-                                   .CreateNoWindow = True
-                               }
+        ' Si fue hallado fuera del directorio de ejecución, intentar copiarlo al directorio de ejecución
+        Dim ffmpegTarget = Path.Combine(baseDir, "ffmpeg.exe")
+        Try
+            If Not String.Equals(Path.GetFullPath(ffmpegFound), Path.GetFullPath(ffmpegTarget), StringComparison.OrdinalIgnoreCase) Then
+                ' Forzar copia incluso si la fuente viene del PATH u otra ubicación
+                Directory.CreateDirectory(baseDir)
+                File.Copy(ffmpegFound, ffmpegTarget, overwrite:=True)
+                ffmpegFound = ffmpegTarget
+            End If
+        Catch ex As Exception
+            ' Si falla la copia (p. ej. acceso denegado), continuamos intentando ejecutar desde la ruta encontrada; registramos advertencia
+            Debug.WriteLine($"Advertencia al copiar ffmpeg.exe: {ex.Message}")
+        End Try
 
-                               Using process As Process = Process.Start(startInfo)
-                                   process.WaitForExit()
-                                   Me.Invoke(Sub()
-                                                 If process.ExitCode = 0 Then
-                                                     lblStatus.Text = "¡Éxito! Guardado en: " & Path.GetFileName(outputPath)
-                                                     MessageBox.Show("¡Conversión completada con éxito!", "Kazaa Converter", MessageBoxButtons.OK, MessageBoxIcon.Information)
-                                                 Else
-                                                     lblStatus.Text = "Error durante la conversión."
-                                                     MessageBox.Show("Ocurrió un error al procesar el video con FFmpeg.", "Error de conversión", MessageBoxButtons.OK, MessageBoxIcon.Error)
-                                                 End If
-                                             End Sub)
-                               End Using
-                           Catch ex As Exception
-                               Me.Invoke(Sub()
-                                             lblStatus.Text = "No se encontró ffmpeg.exe al lado de la app."
-                                             MessageBox.Show("Asegúrate de colocar el archivo 'ffmpeg.exe' dentro de la misma carpeta donde ejecutas este programa." & vbCrLf & vbCrLf & ex.Message, "FFmpeg no encontrado", MessageBoxButtons.OK, MessageBoxIcon.Warning)
-                                         End Sub)
-                           Finally
-                               Me.Invoke(Sub()
-                                             btnConvert.Enabled = True
-                                             btnBrowse.Enabled = True
-                                         End Sub)
-                           End Try
-                       End Sub)
-    End Sub
+        ' Registrar en la UI qué ruta de ffmpeg se va a usar (seguro para hilos)
+        Try
+            Dim usedPath = ffmpegFound
+            If Me IsNot Nothing AndAlso lblStatus IsNot Nothing Then
+                If Me.InvokeRequired Then
+                    Me.Invoke(Sub() lblStatus.Text = $"FFmpeg usado: {usedPath}")
+                Else
+                    lblStatus.Text = $"FFmpeg usado: {usedPath}"
+                End If
+            End If
+        Catch ex As Exception
+            Debug.WriteLine($"No se pudo actualizar lblStatus con la ruta de ffmpeg: {ex.Message}")
+        End Try
+
+        Dim target = If(usePal, "pal-vcd", "ntsc-vcd")
+        Dim arguments = $"-y -i {Quote(inputPath)} -target {target} -b:a 128k {Quote(outputPath)}"
+
+        Dim psi As New ProcessStartInfo With {
+            .FileName = ffmpegFound,
+            .Arguments = arguments,
+            .WorkingDirectory = baseDir,
+            .UseShellExecute = False,
+            .CreateNoWindow = True,
+            .RedirectStandardOutput = True,
+            .RedirectStandardError = True
+        }
+
+        Using proc As New Process()
+            proc.StartInfo = psi
+            proc.EnableRaisingEvents = True
+
+            Dim stderr As New StringBuilder()
+            AddHandler proc.ErrorDataReceived, Sub(sender, e)
+                                                   If e.Data IsNot Nothing Then stderr.AppendLine(e.Data)
+                                               End Sub
+            AddHandler proc.OutputDataReceived, Sub(sender, e)
+                                                    If e.Data IsNot Nothing Then Debug.WriteLine(e.Data)
+                                                End Sub
+
+            Dim tcs As New TaskCompletionSource(Of Integer)()
+            AddHandler proc.Exited, Sub(s, e)
+                                        tcs.TrySetResult(proc.ExitCode)
+                                    End Sub
+
+            If Not proc.Start() Then
+                Throw New InvalidOperationException("No se pudo iniciar ffmpeg.")
+            End If
+
+            proc.BeginErrorReadLine()
+            proc.BeginOutputReadLine()
+
+            Dim exitCode = Await tcs.Task.ConfigureAwait(False)
+
+            If exitCode <> 0 Then
+                Dim errText = stderr.ToString()
+                Throw New Exception($"FFmpeg finalizó con código {exitCode}. Detalles: {errText}")
+            End If
+
+            Return exitCode
+        End Using
+    End Function
 End Class
